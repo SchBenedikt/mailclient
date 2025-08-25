@@ -15,10 +15,35 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // CORS-Konfiguration mit Umgebungsvariablen
+// Unterstützt mehrere Origins via comma-separated CORS_ORIGIN env var
+const corsOriginEnv = process.env.CORS_ORIGIN || 'http://localhost:5173';
+const allowedOrigins = corsOriginEnv.split(',').map(o => o.trim()).filter(Boolean);
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  origin: (origin, callback) => {
+    // Allow non-browser or same-origin requests (no Origin header)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    // Optionally allow any localhost origin (different ports) during development
+    if (process.env.ALLOW_LOCALHOST_ORIGINS === 'true') {
+      try {
+        const isLocalhost = /^https?:\/\/localhost(:\d+)?$/.test(origin);
+        if (isLocalhost) return callback(null, true);
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    console.warn(`Blocked CORS request from origin: ${origin}. Allowed: ${allowedOrigins.join(', ')}`);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
 }));
 
 // JSON-Parser für Anfragen mit großen Payloads aktivieren
@@ -65,7 +90,7 @@ app.post('/api/connect', async (req, res) => {
   console.log(`Verbindungsversuch zu ${host}:${port} für ${email}`);
   
   try {
-    const imap = await createImapConnection({ email, password, host, port, secure });
+  const imap = await createImapConnection({ email, password, host, port, secure });
     
     // Session-ID generieren
     const sessionId = Math.random().toString(36).substring(2, 15);
@@ -75,8 +100,58 @@ app.post('/api/connect', async (req, res) => {
     res.json({ success: true, sessionId });
   } catch (error) {
     console.error('Verbindungsfehler:', error);
+    // If the IMAP library indicates an authentication failure, return 401
+    if (error && (error.source === 'authentication' || error.type === 'no' || /auth/i.test(error.message || ''))) {
+      return res.status(401).json({ success: false, error: 'authentication failed' });
+    }
+
+    // Map common connection errors to clearer messages
+    if (error && error.code === 'ECONNREFUSED') {
+      return res.status(502).json({ success: false, error: 'connection refused' });
+    }
+
+    if (error && error.code === 'ENOTFOUND') {
+      return res.status(502).json({ success: false, error: 'host not found' });
+    }
+
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+
+// Quick IMAP reachability check (TCP connect) to give useful feedback before attempting auth
+app.post('/api/check-imap', async (req, res) => {
+  const { host, port } = req.body;
+  if (!host || !port) return res.status(400).json({ success: false, error: 'host and port required' });
+
+  const net = await import('net');
+  const socket = new net.Socket();
+  const timeoutMs = 5000;
+  let settled = false;
+
+  socket.setTimeout(timeoutMs);
+  socket.once('connect', () => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    return res.json({ success: true, reachable: true });
+  });
+
+  socket.once('timeout', () => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    return res.status(504).json({ success: false, error: 'timeout' });
+  });
+
+  socket.once('error', (err) => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    return res.status(502).json({ success: false, error: err.message });
+  });
+
+  socket.connect(port, host);
 });
 
 // Alle Ordner abrufen
@@ -392,15 +467,16 @@ app.get('/api/email/:id', async (req, res) => {
       let fetchCompleted = false;
       let fetchStarted = false;
       
-      // Versuche zuerst UID-basiertes Abrufen
+      // Versuche zuerst UID-basiertes Abrufen (explizit als UID)
       try {
         fetchStarted = true;
-        console.log(`Abrufen von E-Mail mit UID ${id}`);
-        
+        console.log(`Abrufen von E-Mail mit UID ${id} (UID mode)`);
+
         const fetch = imap.fetch(id, {
           bodies: [''],
           struct: true,
-          size: true
+          size: true,
+          uid: true
         });
         
         let emailData = null;
@@ -547,17 +623,48 @@ app.get('/api/email/:id', async (req, res) => {
         
         fetch.once('error', (err) => {
           console.error(`Fehler beim Abrufen von E-Mail ${id} mit UID:`, err);
-          // Nur wenn keine Antwort gesendet wurde, versuche es mit Sequenznummer
+          // If UID fetch failed or returned nothing, try sequence fetch as fallback
           if (!hasResponded && !fetchCompleted) {
-            console.log(`Suchen nach E-Mail mit Sequenznummer ${id} statt UID`);
-            
-            // Fallback auf Sequenznummer
+            console.log(`UID-Fetch fehlgeschlagen, versuche Sequenznummer ${id}`);
+
             try {
               const seqFetch = imap.seq.fetch(id, { bodies: [''], struct: true });
-              
-              // gleiche Verarbeitung wie oben
-              // ...
-              
+
+              seqFetch.on('message', (msg, seqno) => {
+                // process similarly to UID fetch
+                let bufferChunks = [];
+                msg.on('body', (stream) => {
+                  stream.on('data', (chunk) => bufferChunks.push(chunk));
+                  stream.on('end', () => {
+                    const buffer = Buffer.concat(bufferChunks);
+                    simpleParser(buffer)
+                      .then(parsed => {
+                        if (fetchCompleted) return;
+                        fetchCompleted = true;
+                        const emailData = {
+                          id: id.toString(),
+                          subject: parsed.subject || 'Kein Betreff',
+                          from: parsed.from ? { name: parsed.from.value[0]?.name || '', address: parsed.from.value[0]?.address || '' } : { name: '', address: '' },
+                          to: parsed.to ? parsed.to.value.map(to => ({ name: to.name || '', address: to.address || '' })) : [],
+                          date: parsed.date || new Date(),
+                          body: parsed.html || parsed.textAsHtml || (parsed.text ? `<pre>${parsed.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>` : '<p>Keine Inhalte</p>'),
+                          isRead: true,
+                          hasAttachments: parsed.attachments && parsed.attachments.length > 0
+                        };
+
+                        if (!hasResponded) {
+                          hasResponded = true;
+                          clearTimeout(timeout);
+                          return res.json({ success: true, email: emailData });
+                        }
+                      })
+                      .catch(parseErr => {
+                        console.error('Fehler beim Parsen im Sequenz-Fallback:', parseErr);
+                      });
+                  });
+                });
+              });
+
               seqFetch.once('error', (seqErr) => {
                 console.error(`Fehler beim Abrufen mit Sequenznummer für E-Mail ${id}:`, seqErr);
                 if (!hasResponded) {
@@ -566,10 +673,10 @@ app.get('/api/email/:id', async (req, res) => {
                   res.status(500).json({ success: false, error: seqErr.message });
                 }
               });
-              
+
               seqFetch.once('end', () => {
                 if (!hasResponded && !fetchCompleted) {
-                  console.log(`Keine E-Mail mit ID ${id} gefunden`);
+                  console.log(`Keine E-Mail mit ID ${id} gefunden (nach Sequenz-Fallback)`);
                   hasResponded = true;
                   clearTimeout(timeout);
                   res.status(404).json({ success: false, error: 'E-Mail nicht gefunden' });
@@ -591,24 +698,92 @@ app.get('/api/email/:id', async (req, res) => {
           
           // Wenn wir bis hier kommen und keine E-Mail gefunden haben und noch nicht geantwortet haben
           if (!hasResponded && !fetchCompleted && fetchStarted) {
-            console.log(`Keine E-Mail mit UID ${id} gefunden, versuche mit Sequenznummer`);
-            
+            console.log(`Keine E-Mail mit UID ${id} gefunden direkt — suche in den letzten Nachrichten`);
+
             try {
-              const seqFetch = imap.seq.fetch(id, { bodies: [''], struct: true });
-              
-              // Verarbeitung für Sequenznummer (gleicher Code wie oben)
-              // ... 
-              
-              seqFetch.once('end', () => {
-                if (!hasResponded && !fetchCompleted) {
-                  console.log(`Keine E-Mail mit ID ${id} gefunden (weder UID noch Sequenznummer)`);
+              const recentCount = Math.min(200, box.messages.total || 200);
+              const start = Math.max(1, (box.messages.total || 1) - recentCount + 1);
+              const range = `${start}:${box.messages.total}`;
+
+              console.log(`Untersuche Bereich ${range} nach UID ${id}`);
+
+              const headerFetch = imap.seq.fetch(range, { bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)'], struct: true });
+              let foundSeq = null;
+
+              headerFetch.on('message', (msg, seqno) => {
+                msg.once('attributes', (attrs) => {
+                  if (attrs && attrs.uid && attrs.uid.toString() === id.toString()) {
+                    foundSeq = seqno;
+                  }
+                });
+              });
+
+              headerFetch.once('end', async () => {
+                if (foundSeq) {
+                  console.log(`UID ${id} gefunden als Sequenznummer ${foundSeq}, lade E-Mail`);
+                  try {
+                    const fullFetch = imap.seq.fetch(foundSeq, { bodies: [''], struct: true });
+                    let fetched = false;
+
+                    fullFetch.on('message', (msg) => {
+                      const chunks = [];
+                      msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => chunks.push(chunk));
+                        stream.on('end', () => {
+                          const buffer = Buffer.concat(chunks);
+                          simpleParser(buffer)
+                            .then(parsed => {
+                              if (fetched) return;
+                              fetched = true;
+                              const emailData = {
+                                id: id.toString(),
+                                subject: parsed.subject || 'Kein Betreff',
+                                from: parsed.from ? { name: parsed.from.value[0]?.name || '', address: parsed.from.value[0]?.address || '' } : { name: '', address: '' },
+                                to: parsed.to ? parsed.to.value.map(to => ({ name: to.name || '', address: to.address || '' })) : [],
+                                date: parsed.date || new Date(),
+                                body: parsed.html || parsed.textAsHtml || (parsed.text ? `<pre>${parsed.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>` : '<p>Keine Inhalte</p>'),
+                                isRead: true,
+                                hasAttachments: parsed.attachments && parsed.attachments.length > 0
+                              };
+
+                              if (!hasResponded) {
+                                hasResponded = true;
+                                clearTimeout(timeout);
+                                return res.json({ success: true, email: emailData });
+                              }
+                            })
+                            .catch(err => {
+                              console.error('Fehler beim Parsen nach gefundenem SeqFetch:', err);
+                            });
+                        });
+                      });
+                    });
+
+                    fullFetch.once('end', () => {
+                      if (!hasResponded && !fetched) {
+                        console.log('Gefundene Sequenz wurde geladen, aber keine Nachricht geparst');
+                        hasResponded = true;
+                        clearTimeout(timeout);
+                        res.status(404).json({ success: false, error: 'E-Mail nicht gefunden' });
+                      }
+                    });
+                  } catch (err) {
+                    console.error('Fehler beim Laden der gefundenen Sequenz:', err);
+                    if (!hasResponded) {
+                      hasResponded = true;
+                      clearTimeout(timeout);
+                      res.status(500).json({ success: false, error: err.message });
+                    }
+                  }
+                } else {
+                  console.log(`UID ${id} nicht in den letzten ${recentCount} Nachrichten gefunden`);
                   hasResponded = true;
                   clearTimeout(timeout);
                   res.status(404).json({ success: false, error: 'E-Mail nicht gefunden' });
                 }
               });
             } catch (error) {
-              console.error(`Fehler beim Erstellen des Sequenz-Fetches für E-Mail ${id}:`, error);
+              console.error('Fehler beim Durchsuchen der letzten Nachrichten:', error);
               if (!hasResponded) {
                 hasResponded = true;
                 clearTimeout(timeout);

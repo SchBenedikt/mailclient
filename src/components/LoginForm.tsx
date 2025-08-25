@@ -18,7 +18,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { fetchServerConfig, EmailProvider } from "@/lib/config";
+import { fetchServerConfig, EmailProvider, API_URL } from "@/lib/config";
+import { saveServerConfig, loadServerConfig as loadSavedServerConfig, saveSession, loadSession } from '@/lib/storage';
 
 interface LoginFormProps {
   onSuccess: () => void;
@@ -38,16 +39,17 @@ const LoginForm = ({ onSuccess }: LoginFormProps) => {
   const [smtpHost, setSmtpHost] = useState("smtp.web.de");
   const [smtpPort, setSmtpPort] = useState("587");
   const [smtpSecure, setSmtpSecure] = useState(false);
+  const [rememberDevice, setRememberDevice] = useState(false);
   
-  const { login, isLoading, isConnecting } = useEmail();
+  const { login, isLoading, isConnecting, restoreSession } = useEmail();
 
   // Load server configurations on component mount
   useEffect(() => {
-    const loadServerConfig = async () => {
+    const initConfig = async () => {
       try {
         const config = await fetchServerConfig();
         setEmailProviders(config.emailProviders);
-        
+
         // Set default values from the first provider
         if (config.emailProviders.length > 0) {
           const defaultProvider = config.emailProviders[0];
@@ -58,12 +60,33 @@ const LoginForm = ({ onSuccess }: LoginFormProps) => {
           setSmtpPort(defaultProvider.smtpPort.toString());
           setSmtpSecure(defaultProvider.secure);
         }
+
+        // Load saved server config/session if available
+        const saved = loadSavedServerConfig();
+        if (saved) {
+          setImapHost(saved.imapHost);
+          setImapPort(saved.imapPort.toString());
+          setImapSecure(saved.imapSecure);
+          setSmtpHost(saved.smtpHost);
+          setSmtpPort(saved.smtpPort.toString());
+          setSmtpSecure(saved.smtpSecure);
+          setRememberDevice(true);
+        }
+        const savedSession = loadSession();
+        if (savedSession) {
+          try {
+            const ok = await restoreSession(savedSession);
+            if (ok) onSuccess();
+          } catch (e) {
+            // ignore and continue to regular login
+          }
+        }
       } catch (error) {
         console.error("Failed to load server configuration:", error);
       }
     };
-    
-    loadServerConfig();
+
+    initConfig();
   }, []);
 
   // Handle provider change
@@ -83,8 +106,7 @@ const LoginForm = ({ onSuccess }: LoginFormProps) => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
-    // Prepare server config
+
     const serverConfig = {
       imap: {
         host: imapHost,
@@ -97,9 +119,43 @@ const LoginForm = ({ onSuccess }: LoginFormProps) => {
         secure: smtpSecure
       }
     };
-    
-    const success = await login(email, password, serverConfig);
-    if (success) {
+
+    // Pre-check IMAP host/port reachability to give immediate feedback
+    try {
+      const checkResp = await fetch(`${API_URL}/check-imap`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: serverConfig.imap.host, port: serverConfig.imap.port })
+      });
+
+      if (!checkResp.ok) {
+        const err = await checkResp.json().catch(() => ({ error: 'Imap check failed' }));
+        throw new Error(err.error || 'Cannot reach IMAP host');
+      }
+    } catch (err: any) {
+      console.error('IMAP pre-check failed', err);
+      // Show user-friendly error and abort
+      alert(`Cannot reach IMAP host ${serverConfig.imap.host}:${serverConfig.imap.port} — ${err.message}`);
+      return;
+    }
+
+    const session = await login(email, password, serverConfig);
+    if (session) {
+      if (rememberDevice) {
+        saveServerConfig({
+          imapHost: serverConfig.imap.host,
+          imapPort: serverConfig.imap.port,
+          imapSecure: serverConfig.imap.secure,
+          smtpHost: serverConfig.smtp.host,
+          smtpPort: serverConfig.smtp.port,
+          smtpSecure: serverConfig.smtp.secure,
+        });
+        try {
+          saveSession(session as string);
+        } catch (e) {
+          // ignore
+        }
+      }
       onSuccess();
     }
   };
@@ -111,7 +167,6 @@ const LoginForm = ({ onSuccess }: LoginFormProps) => {
           <div className="flex justify-center mb-4">
             <div className="webde-logo text-3xl text-primary font-bold">EMAIL</div>
           </div>
-          <CardTitle className="text-2xl text-center">Sign In</CardTitle>
           <CardDescription className="text-center">
             Enter your email login credentials
           </CardDescription>
@@ -262,6 +317,12 @@ const LoginForm = ({ onSuccess }: LoginFormProps) => {
                 "Sign In"
               )}
             </Button>
+            <div className="flex items-center justify-between mt-2">
+              <div className="flex items-center">
+                <Checkbox id="rememberDevice" checked={rememberDevice} onCheckedChange={(v) => setRememberDevice(v === true)} />
+                <Label htmlFor="rememberDevice" className="ml-2 text-sm">Remember this device</Label>
+              </div>
+            </div>
           </form>
         </CardContent>
         <CardFooter className="flex flex-col space-y-2">

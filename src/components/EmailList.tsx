@@ -14,7 +14,7 @@ interface EmailListProps {
 }
 
 const EmailList = ({ onSelectEmail }: EmailListProps) => {
-  const { emails, selectedEmail, currentFolder, fetchEmail } = useEmail();
+  const { emails, selectedEmail, currentFolder, fetchEmail, fetchingEmailId } = useEmail();
   const isMobile = useIsMobile();
   const [searchTerm, setSearchTerm] = useState("");
 
@@ -65,6 +65,7 @@ const EmailList = ({ onSelectEmail }: EmailListProps) => {
   }, [currentFolder]);
 
   const handleEmailClick = useCallback((email) => {
+    if (fetchingEmailId && fetchingEmailId === email.id) return;
     fetchEmail(email.id);
     // Callback for mobile view
     if (onSelectEmail) {
@@ -138,8 +139,14 @@ const EmailList = ({ onSelectEmail }: EmailListProps) => {
                   </div>
                   <div className="text-sm truncate">{email.subject}</div>
                   <div className="flex items-center mt-1">
-                    <div className="text-xs text-gray-500 truncate">
-                      {createPreview(email.body)}
+                    <div className="text-xs text-gray-500 truncate flex items-center">
+                      <div className="truncate">{createPreview(email.body)}</div>
+                      {fetchingEmailId === email.id && (
+                        <svg className="animate-spin h-4 w-4 ml-2 text-gray-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                        </svg>
+                      )}
                     </div>
                     {email.hasAttachments && (
                       <Paperclip className="h-3 w-3 ml-1 text-gray-400 shrink-0" />

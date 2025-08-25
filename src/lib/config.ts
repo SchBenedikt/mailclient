@@ -1,5 +1,6 @@
 // Config service to handle configuration and environment variables
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+// Use VITE_API_URL if provided, otherwise default to the backend server on port 3000
+export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 // Email provider configuration interface
 export interface EmailProvider {

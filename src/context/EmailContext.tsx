@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useState, ReactNode, useRef } from 'react';
 import { EmailAccount, EmailMessage, Folder, WebDeServerConfig } from '@/types/email';
 import { useToast } from '@/components/ui/use-toast';
 
@@ -8,7 +8,8 @@ interface EmailContextType {
   selectedEmail: EmailMessage | null;
   folders: Folder[];
   isLoading: boolean;
-  login: (email: string, password: string, serverConfig?: WebDeServerConfig) => Promise<boolean>;
+  fetchingEmailId: string | null;
+  login: (email: string, password: string, serverConfig?: WebDeServerConfig) => Promise<string | false>;
   logout: () => void;
   selectEmail: (email: EmailMessage | null) => void;
   markAsRead: (id: string) => void;
@@ -21,6 +22,7 @@ interface EmailContextType {
   sendEmail: (emailData: any) => Promise<void>;
   forwardEmail: (forwardData: any) => Promise<void>;
   deleteEmail: (id: string) => Promise<void>;
+  restoreSession: (sessionId: string) => Promise<boolean>;
 }
 
 // Standard Konfiguration für Web.de als Fallback
@@ -37,8 +39,9 @@ const DEFAULT_CONFIG: WebDeServerConfig = {
   }
 };
 
-// API URL
-const API_URL = 'http://localhost:3001/api';
+// API URL - prefer VITE_API_URL, otherwise default to backend on port 3000
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+const API_URL = `${API_BASE}/api`;
 
 const EmailContext = createContext<EmailContextType | undefined>(undefined);
 
@@ -51,12 +54,13 @@ export function EmailProvider({ children }: { children: ReactNode }) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [currentFolder, setCurrentFolder] = useState('INBOX');
   const [folders, setFolders] = useState<Folder[]>([
-    { id: 'INBOX', name: 'Posteingang', unread: 0 },
-    { id: 'Sent', name: 'Gesendet', unread: 0 },
-    { id: 'Drafts', name: 'Entwürfe', unread: 0 },
-    { id: 'Trash', name: 'Papierkorb', unread: 0 },
+    { id: 'INBOX', name: 'Inbox', unread: 0 },
+    { id: 'Sent', name: 'Sent', unread: 0 },
+    { id: 'Drafts', name: 'Drafts', unread: 0 },
+    { id: 'Trash', name: 'Trash', unread: 0 },
     { id: 'Spam', name: 'Spam', unread: 0 },
   ]);
+  const [fetchingEmailId, setFetchingEmailId] = useState<string | null>(null);
   const { toast } = useToast();
 
   const login = async (email: string, password: string, serverConfig?: WebDeServerConfig) => {
@@ -91,9 +95,15 @@ export function EmailProvider({ children }: { children: ReactNode }) {
         throw new Error('Server returned an invalid response. Please check if the server is running correctly.');
       }
       
+      // Prefer explicit handling based on status codes
       const data = await response.json();
-      
-      if (!data.success) {
+
+      if (response.status === 401) {
+        // Authentication failure
+        throw new Error('Authentication failed: please check email, password, and provider requirements (app password / IMAP enabled).');
+      }
+
+      if (!response.ok || !data.success) {
         throw new Error(data.error || 'Anmeldung fehlgeschlagen');
       }
       
@@ -120,22 +130,54 @@ export function EmailProvider({ children }: { children: ReactNode }) {
       await fetchEmails('INBOX', data.sessionId);
       
       toast({
-        title: "Erfolgreich angemeldet",
-        description: `Sie wurden erfolgreich bei ${config.imap.host} angemeldet.`,
+        title: "Logged in",
+        description: `Successfully signed in to ${config.imap.host}.`,
       });
       
-      return true;
+      return data.sessionId || false;
     } catch (error) {
       console.error('Login error:', error);
+
+      // Network-level errors
+      let message = error instanceof Error ? error.message : 'Beim Anmelden ist ein Fehler aufgetreten.';
+
+      if (message.includes('ECONNREFUSED')) {
+        message = 'Connection refused to IMAP server. Check host and port, and ensure the IMAP server accepts connections.';
+      } else if (message.includes('ENOTFOUND')) {
+        message = 'IMAP host not found. Verify the IMAP server hostname.';
+      } else if (message.toLowerCase().includes('authentication')) {
+        message = 'Authentication failed. Check your email/password and whether IMAP or an app-specific password is required.';
+      }
+
       toast({
-        title: "Anmeldefehler",
-        description: error instanceof Error ? error.message : "Beim Anmelden ist ein Fehler aufgetreten. Bitte überprüfen Sie Ihre Anmeldedaten und Servereinstellungen.",
+        title: "Login failed",
+        description: message,
         variant: "destructive",
       });
-      return false;
+  return false;
     } finally {
       setIsLoading(false);
       setIsConnecting(false);
+    }
+  };
+
+  const restoreSession = async (sid: string) => {
+    if (!sid) return false;
+    setIsLoading(true);
+    try {
+      setSessionId(sid);
+      // Try to fetch folders and emails using the provided session id
+      await fetchFolders(sid);
+      await fetchEmails('INBOX', sid);
+      toast({ title: 'Session restored', description: 'Restored saved session.' });
+      return true;
+    } catch (err) {
+      console.error('Failed to restore session', err);
+      // Clear session id
+      setSessionId(null);
+      return false;
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -176,8 +218,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Error fetching folders:', error);
       toast({
-        title: "Fehler",
-        description: "Beim Abrufen der E-Mail-Ordner ist ein Fehler aufgetreten.",
+        title: "Error",
+        description: "An error occurred while fetching folders.",
         variant: "destructive",
       });
     } finally {
@@ -213,8 +255,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Error fetching emails:', error);
       toast({
-        title: "Fehler",
-        description: "Beim Abrufen der E-Mails ist ein Fehler aufgetreten.",
+        title: "Error",
+        description: "An error occurred while fetching emails.",
         variant: "destructive",
       });
     } finally {
@@ -225,95 +267,127 @@ export function EmailProvider({ children }: { children: ReactNode }) {
   const fetchEmail = async (id: string, sid: string = sessionId || '') => {
     if (!sid) return;
     
-    setIsLoading(true);
+  setIsLoading(true);
+  setFetchingEmailId(id);
     
     try {
-      let retryCount = 0;
-      const maxRetries = 3;
-      let success = false;
-      let response;
-      let data;
-      
-      // Versuche mit mehreren Retries, unterschiedliche IDs zu handhaben
-      while (!success && retryCount < maxRetries) {
-        try {
-          console.log(`Versuche E-Mail mit ID ${id} abzurufen (Versuch ${retryCount + 1}/${maxRetries})`);
-          
-          // Beim ersten Versuch benutzen wir die Original-ID
-          // Bei weiteren Versuchen können wir versuchen, die ID zu modifizieren
-          let effectiveId = id;
-          
-          if (retryCount === 1) {
-            // Zweiter Versuch: Prüfe, ob ID eine UID ist und konvertiere sie 
-            // in eine normale Sequenznummer (wenn die ID hoch ist)
-            if (parseInt(id) > 10000) {
-              // Möglicherweise eine UID, versuche die neueste E-Mail im Ordner zu bekommen
-              console.log("Versuche E-Mail über neueste E-Mails im Ordner zu finden");
-              const emailsResponse = await fetch(`${API_URL}/emails?sessionId=${sid}&folder=${currentFolder}`);
-              
-              // Check if response is actually JSON
-              const emailsContentType = emailsResponse.headers.get('content-type');
-              if (!emailsContentType || !emailsContentType.includes('application/json')) {
-                const errorText = await emailsResponse.text();
-                console.error('Server returned non-JSON response:', errorText);
-                throw new Error('Server returned an invalid response. Please check if the server is running correctly.');
+      // Prevent duplicate simultaneous fetches for the same id
+      const inFlightMap = (fetchEmail as any)._inFlight || new Map<string, Promise<any>>();
+      (fetchEmail as any)._inFlight = inFlightMap;
+
+      if (inFlightMap.has(id)) {
+        // Wait for the existing fetch to finish and reuse its result
+        await inFlightMap.get(id);
+        setIsLoading(false);
+        return;
+      }
+
+      const fetchPromise = (async () => {
+        // Try multiple candidate IDs in parallel (original id and possible uid fallback)
+        const candidates: string[] = [id];
+
+        // If we have local info about uid, include it
+        const local = emails.find(e => e.id === id || e.uid === id);
+        if (local && local.uid && !candidates.includes(local.uid)) candidates.push(local.uid);
+
+        // Also, if id looks like a uid (large number) and we have local mapping, try to include mapped id
+        const mappedId = emails.find(e => e.uid === id)?.id;
+        if (mappedId && !candidates.includes(mappedId)) candidates.push(mappedId);
+
+        // Start parallel fetches and take the first successful response
+        const controllers: AbortController[] = [];
+        const fetchTasks = candidates.map(candidate => {
+          const ac = new AbortController();
+          controllers.push(ac);
+          return (async () => {
+            try {
+              const resp = await fetch(`${API_URL}/email/${candidate}?sessionId=${sid}&folder=${currentFolder}`, { signal: ac.signal });
+              const ct = resp.headers.get('content-type') || '';
+              if (!ct.includes('application/json')) {
+                const txt = await resp.text();
+                throw new Error('Invalid server response');
               }
-              
-              const emailsData = await emailsResponse.json();
-              
-              if (emailsData.success && emailsData.emails.length > 0) {
-                // Suche nach der E-Mail mit der UID
-                const foundEmail = emailsData.emails.find((e: EmailMessage) => 
-                  e.id === id || e.uid === id
-                );
-                
-                if (foundEmail) {
-                  console.log(`E-Mail mit ID ${id} in Liste gefunden, verwende ID ${foundEmail.id}`);
-                  effectiveId = foundEmail.id;
+              const json = await resp.json();
+              if (json.success) return json;
+              throw new Error(json.error || 'E-Mail nicht gefunden');
+            } catch (err) {
+              throw err;
+            }
+          })();
+        });
+
+        try {
+          // firstFulfilled: resolves with the first fulfilled promise
+          const firstFulfilled = (proms: Promise<any>[]) => new Promise<any>((resolve, reject) => {
+            let rejected = 0;
+            const errors: any[] = [];
+            proms.forEach((p, idx) => {
+              Promise.resolve(p).then(res => resolve(res)).catch(err => {
+                errors[idx] = err;
+                rejected++;
+                if (rejected === proms.length) reject(errors);
+              });
+            });
+          });
+
+          const result = await firstFulfilled(fetchTasks);
+          // Cancel other fetches
+          controllers.forEach(c => c.abort());
+          return result;
+        } catch (aggregateErr) {
+          // All parallel attempts failed — fall back to sequential retries using existing logic
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              console.log(`Fallback sequential attempt ${attempt + 1} to fetch email ${id}`);
+              // Optionally refresh the local email list on second attempt
+              if (attempt === 1) {
+                try {
+                  await fetchEmails(currentFolder, sid);
+                } catch (e) {
+                  // ignore
                 }
               }
+
+              // Determine effectiveId for this attempt
+              let effectiveId = id;
+              if (attempt === 1 && parseInt(id) > 10000) {
+                const found = emails.find(e => e.id === id || e.uid === id);
+                if (found) effectiveId = found.id;
+              }
+              if (attempt === 2) {
+                const uidFallback = emails.find(e => e.id.toString() === id)?.uid;
+                if (uidFallback) effectiveId = uidFallback;
+              }
+
+              const resp = await fetch(`${API_URL}/email/${effectiveId}?sessionId=${sid}&folder=${currentFolder}`);
+              const ct = resp.headers.get('content-type') || '';
+              if (!ct.includes('application/json')) {
+                const txt = await resp.text();
+                throw new Error('Invalid server response');
+              }
+              const json = await resp.json();
+              if (json.success) return json;
+              // otherwise throw and continue
+              throw new Error(json.error || 'E-Mail nicht gefunden');
+            } catch (err) {
+              // short backoff
+              await new Promise(r => setTimeout(r, 250));
+              if (attempt === 2) throw err;
             }
-          } else if (retryCount === 2) {
-            // Dritter Versuch: Verwende eventuell die UID, falls es eine Sequenznummer war
-            const uidFallback = emails.find(e => e.id.toString() === id)?.uid;
-            if (uidFallback) {
-              console.log(`Versuche mit UID ${uidFallback} statt ID ${id}`);
-              effectiveId = uidFallback;
-            }
           }
-          
-          response = await fetch(`${API_URL}/email/${effectiveId}?sessionId=${sid}&folder=${currentFolder}`);
-          
-          // Check if response is actually JSON
-          const contentType = response.headers.get('content-type');
-          if (!contentType || !contentType.includes('application/json')) {
-            const errorText = await response.text();
-            console.error('Server returned non-JSON response:', errorText);
-            throw new Error('Server returned an invalid response. Please check if the server is running correctly.');
-          }
-          
-          data = await response.json();
-          
-          if (data.success) {
-            success = true;
-            break;
-          } else {
-            console.log(`Versuch ${retryCount + 1} fehlgeschlagen: ${data.error}`);
-            retryCount++;
-          }
-        } catch (err) {
-          console.error(`Fehler beim Abrufen der E-Mail (Versuch ${retryCount + 1}):`, err);
-          retryCount++;
-          // Kurze Pause vor dem nächsten Versuch
-          await new Promise(resolve => setTimeout(resolve, 500));
         }
+      })();
+
+      inFlightMap.set(id, fetchPromise);
+
+      let data;
+      try {
+        const result = await fetchPromise;
+        data = result;
+      } finally {
+        inFlightMap.delete(id);
       }
-      
-      if (!success) {
-        throw new Error(data?.error || 'Fehler beim Abrufen der E-Mail nach mehreren Versuchen');
-      }
-      
-      // E-Mail aus den Daten extrahieren
+
       const emailData = data.email;
       
       // Stelle sicher, dass die ID und UID konsistent sind
@@ -342,21 +416,22 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Error fetching email:', error);
       toast({
-        title: "Fehler",
-        description: "Beim Abrufen der E-Mail ist ein Fehler aufgetreten. " + 
+        title: "Error",
+        description: "An error occurred while fetching the email. " + 
                     (error instanceof Error ? error.message : ""),
         variant: "destructive",
       });
     } finally {
-      setIsLoading(false);
+  setIsLoading(false);
+  setFetchingEmailId(null);
     }
   };
 
   const sendEmail = async (emailData: any) => {
     if (!sessionId || !account) {
       toast({
-        title: "Fehler",
-        description: "Sie sind nicht angemeldet.",
+        title: "Error",
+        description: "You are not logged in.",
         variant: "destructive",
       });
       throw new Error("Nicht angemeldet");
@@ -402,8 +477,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
       }
       
       toast({
-        title: "E-Mail gesendet",
-        description: "Ihre E-Mail wurde erfolgreich gesendet.",
+        title: "Email sent",
+        description: "Your email was sent successfully.",
       });
       
       // Aktualisiere die gesendeten E-Mails
@@ -413,8 +488,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Error sending email:', error);
       toast({
-        title: "Fehler",
-        description: error instanceof Error ? error.message : "Beim Senden der E-Mail ist ein Fehler aufgetreten.",
+        title: "Error",
+        description: error instanceof Error ? error.message : "An error occurred while sending the email.",
         variant: "destructive",
       });
       throw error;
@@ -459,8 +534,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
       }
       
       toast({
-        title: "E-Mail weitergeleitet",
-        description: "Die E-Mail wurde erfolgreich weitergeleitet.",
+        title: "Email forwarded",
+        description: "The email was forwarded successfully.",
       });
       
       // Aktualisiere die gesendeten E-Mails
@@ -470,8 +545,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Error forwarding email:', error);
       toast({
-        title: "Fehler",
-        description: error instanceof Error ? error.message : "Beim Weiterleiten der E-Mail ist ein Fehler aufgetreten.",
+        title: "Error",
+        description: error instanceof Error ? error.message : "An error occurred while forwarding the email.",
         variant: "destructive",
       });
       throw error;
@@ -500,8 +575,8 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     setSelectedEmail(null);
     setSessionId(null);
     toast({
-      title: "Abgemeldet",
-      description: "Sie wurden erfolgreich abgemeldet.",
+      title: "Logged out",
+      description: "You have been logged out.",
     });
   };
 
@@ -584,7 +659,9 @@ export function EmailProvider({ children }: { children: ReactNode }) {
     selectedEmail,
     folders,
     isLoading,
+  fetchingEmailId,
     login,
+  restoreSession,
     logout,
     selectEmail,
     markAsRead,

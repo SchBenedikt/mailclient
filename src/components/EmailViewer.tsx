@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useState, useCallback } from "react";
 import EmailComposer from "./EmailComposer";
-import EmailSummarizer from "./EmailSummarizer";
+
 import { useIsMobile } from "@/hooks/use-mobile";
 import {
   DropdownMenu,
@@ -68,6 +68,34 @@ const EmailViewer = () => {
   const handleCloseComposer = useCallback(() => {
     setComposerOpen(false);
   }, []);
+
+  // Strip dangerous or external font references from email HTML
+  const sanitizeHtml = (html: string = '') => {
+    if (!html) return '';
+    try {
+      // Remove <link ...> tags that reference external fonts
+      html = html.replace(/<link[^>]*rel=["']?stylesheet["']?[^>]*>/gi, '');
+
+      // Remove @font-face blocks and url(...) references to external font hosts
+      html = html.replace(/@font-face[\s\S]*?\}/gi, '');
+      html = html.replace(/url\([^)]+\)/gi, (match) => {
+        // If the url contains an absolute http(s) host, remove it
+        if (/https?:\/\//i.test(match)) return '';
+        return match;
+      });
+
+      // Remove inline <style> blocks that include font-face or external font urls
+      html = html.replace(/<style[\s\S]*?<\/style>/gi, (styleBlock) => {
+        if (/@font-face|https?:\/\//i.test(styleBlock)) return '';
+        return styleBlock;
+      });
+
+      return html;
+    } catch (e) {
+      console.error('sanitizeHtml error', e);
+      return html;
+    }
+  };
 
   if (!selectedEmail) {
     return (
@@ -183,15 +211,11 @@ const EmailViewer = () => {
       {/* Content - Scrollable */}
       <ScrollArea className="flex-1 overflow-hidden pb-16">
         <div className="p-4">
-          {/* AI Summary Button/Component */}
-          <EmailSummarizer 
-            emailContent={selectedEmail.body} 
-            emailSubject={selectedEmail.subject} 
-          />
+          {/* (Email summarizer removed) */}
 
           <div 
             className="prose max-w-none prose-img:mx-auto prose-img:max-w-full"
-            dangerouslySetInnerHTML={{ __html: selectedEmail.body }}
+            dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedEmail.body) }}
           />
         </div>
       </ScrollArea>
